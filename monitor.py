@@ -25,17 +25,22 @@ def get_okx_symbols(exchange):
         markets = exchange.fetch_tickers()
         df_tickers = pd.DataFrame.from_dict(markets, orient='index')
         df_tickers = df_tickers[df_tickers['symbol'].str.endswith('/USDT')]
-        # 筛选交易额前150的币种，确保逻辑在主流币上更准
-        top_symbols = df_tickers.sort_values('quoteVolume', ascending=False).head(150).index.tolist()
-        return top_symbols
+        # 扫描成交额前150的币种
+        return df_tickers.sort_values('quoteVolume', ascending=False).head(150).index.tolist()
     except Exception as e:
         print(f"获取币种失败: {e}")
         return []
 
-def analyze_divergence_strategy(symbol, df):
-    if df is None or len(df) < 120: return None
+def analyze_strict_divergence(symbol, df):
+    """
+    更新逻辑：
+    1. 仅限周线
+    2. 取消 EMA/MA 均线限制 (纯动能背离判断)
+    3. MACD能量簇面积底背离 (面积萎缩)
+    4. DIF线波谷抬高 (DIF底背离)
+    """
+    if df is None or len(df) < 100: return None
 
-    # 原生 EMA 计算
     def get_ema(series, length):
         return series.ewm(span=length, adjust=False).mean()
 
@@ -48,92 +53,93 @@ def analyze_divergence_strategy(symbol, df):
     dif = ema12 - ema26
     dea = dif.ewm(span=9, adjust=False).mean()
     hist = dif - dea
-    
-    ema55 = get_ema(close, 55)
-    ma99 = close.rolling(window=99).mean()
 
-    # --- 1. 识别能量簇及其对应的价格极值 ---
-    red_clusters = [] # 存储: {"area": 面积, "min_price": 区域最低价}
-    current_area = 0
-    current_min_price = 999999999
+    # --- 提取红色能量簇信息 ---
+    clusters = []
+    curr_area = 0
+    curr_min_dif = 999999
+    curr_min_price = 999999
     in_red = False
     
-    # 扫描最近150根K线，确保覆盖两个大波段
-    recent_hist = hist.tail(150)
-    recent_lows = lows.tail(150)
+    # 回溯周线数据
+    h_subset = hist.tail(150)
+    d_subset = dif.tail(150)
+    l_subset = lows.tail(150)
 
-    for i in range(len(recent_hist)):
-        val = recent_hist.iloc[i]
-        price = recent_lows.iloc[i]
+    for i in range(len(h_subset)):
+        h_val = h_subset.iloc[i]
+        d_val = d_subset.iloc[i]
+        p_val = l_subset.iloc[i]
         
-        if val < 0:
+        if h_val < 0:
             in_red = True
-            current_area += abs(val)
-            current_min_price = min(current_min_price, price)
+            curr_area += abs(h_val)
+            curr_min_dif = min(curr_min_dif, d_val)
+            curr_min_price = min(curr_min_price, p_val)
         else:
             if in_red:
-                red_clusters.append({"area": current_area, "min_price": current_min_price})
-                current_area = 0
-                current_min_price = 999999999
+                clusters.append({
+                    "area": curr_area, 
+                    "min_dif": curr_min_dif, 
+                    "min_price": curr_min_price
+                })
+                curr_area, curr_min_dif, curr_min_price = 0, 999999, 999999
                 in_red = False
     
     if in_red:
-        red_clusters.append({"area": current_area, "min_price": current_min_price})
+        clusters.append({"area": curr_area, "min_dif": curr_min_dif, "min_price": curr_min_price})
 
-    # --- 2. 双重底背离逻辑判断 ---
-    is_divergence = False
-    ratio_str = ""
-    if len(red_clusters) >= 2:
-        prev_c = red_clusters[-2]
-        curr_c = red_clusters[-1]
-        
-        # 判定标准：当前红簇面积小于上一个红簇的45% (能量大幅衰竭)
-        # 且价格不高于前一个底部的10% (处于底部区间或创新低)
-        if curr_c['area'] < (prev_c['area'] * 0.45) and curr_c['area'] > 0:
-            if curr_c['min_price'] <= prev_c['min_price'] * 1.10:
-                is_divergence = True
-                ratio_str = f"{round((curr_c['area']/prev_c['area'])*100, 1)}%"
-
-    # --- 3. 趋势确认：背离形成 + 站上EMA55和MA99 ---
+    # --- 同时底背离判定 ---
+    if len(clusters) < 2: return None
+    
+    prev, curr = clusters[-2], clusters[-1]
+    
+    # 1. 价格条件：当前波段价格低点未大幅反弹（处于低位区间或创新低）
+    price_check = curr['min_price'] <= prev['min_price'] * 1.08
+    
+    # 2. MACD面积背离：当前能量簇面积显著小于前一个 (能量衰竭)
+    area_div = curr['area'] < (prev['area'] * 0.5)
+    
+    # 3. DIF线背离：当前DIF最低点高于前一波 (趋势线抬高)
+    dif_div = curr['min_dif'] > prev['min_dif']
+    
     last_close = close.iloc[-1]
-    if is_divergence and last_close > ema55.iloc[-1] and last_close > ma99.iloc[-1]:
+
+    if price_check and area_div and dif_div:
         return {
             "price": last_close,
-            "ema55": round(ema55.iloc[-1], 6),
-            "ratio": ratio_str
+            "area_ratio": f"{round((curr['area']/prev['area'])*100, 1)}%",
+            "dif_val": round(curr['min_dif'], 6)
         }
     return None
 
 def main():
     exchange = ccxt.okx()
     symbols = get_okx_symbols(exchange)
-    timeframes = {"周线": "1w", "日线": "1d"}
     
-    final_report = "🚨 *OKX 双重底背离预警* 🚨\n"
-    found_any = False
+    label, tf = "周线", "1w"
+    found_signals = []
+    
+    print(f"开始执行{label}纯背离扫描（已取消均线限制）...")
+    
+    for s in symbols:
+        try:
+            # 获取足够长的K线以计算指标
+            ohlcv = exchange.fetch_ohlcv(s, timeframe=tf, limit=200)
+            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+            res = analyze_strict_divergence(s, df)
+            if res:
+                found_signals.append(f"⭐ `{s}`: 现价 `{res['price']}`\n   └ 面积萎缩 `{res['area_ratio']}` | DIF抬高(当前:{res['dif_val']}) ✅")
+            time.sleep(0.1)
+        except: continue
 
-    for label, tf in timeframes.items():
-        found_in_tf = []
-        for s in symbols:
-            try:
-                ohlcv = exchange.fetch_ohlcv(s, timeframe=tf, limit=200)
-                df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-                res = analyze_divergence_strategy(s, df)
-                if res:
-                    icon = "⭐" if label == "周线" else "🔹"
-                    found_in_tf.append(f"{icon} `{s}`: 现价`{res['price']}` (收敛比 `{res['ratio']}`)")
-                    found_any = True
-                time.sleep(0.1)
-            except: continue
-        
-        if found_in_tf:
-            final_report += f"\n🔥 *{label}买入点确认：*\n" + "\n".join(found_in_tf) + "\n"
-
-    if found_any:
-        final_report += "\n⚠️ *策略依据：能量簇二段收敛 + 突破EMA55/MA99*"
-        send_telegram_msg(final_report)
+    if found_signals:
+        report = "🚨 *OKX 周线双重底背离预警 (左侧版)* 🚨\n\n"
+        report += "\n".join(found_signals)
+        report += "\n\n⚠️ *逻辑：价格持平/新低 + MACD红簇面积萎缩 + DIF线底抬高*"
+        send_telegram_msg(report)
     else:
-        print("未发现符合双重底背离的币种。")
+        print("未发现匹配信号。")
 
 if __name__ == "__main__":
     main()
